@@ -48,6 +48,7 @@
 #   0  deployed and verified (status=deployed)
 #   2  proposal recorded but delay not yet elapsed (status=proposed-pending)
 #   1  verification failed; rollback attempted (status=rolled-back|failed)
+#   3  unexpected failure before verification (status=failed)
 #
 # See docs/staging-deployment.md for secrets scope, rotation, and the CI wiring.
 # --- end usage ---
@@ -106,6 +107,21 @@ NEW_WASM_PATH="${4:?ERROR: new-wasm-path argument is required}"
 TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { echo "[$(TS)] $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log"; }
 die() { echo "[$(TS)] ERROR: $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log" >&2; exit 1; }
+
+# Tracks whether a terminal status has been written, so the ERR trap never
+# overwrites a real outcome (deployed/rolled-back/failed/proposed-pending).
+STATUS_WRITTEN=false
+CURRENT_STEP="initialization"
+======= REPLACE
+<<<<<<< SEARCH
+write_status() {
+  # write_status <status> <health> <canary> <note>
+  local status="$1" health="$2" canary="$3" note="$4"
+=======
+write_status() {
+  # write_status <status> <health> <canary> <note>
+  local status="$1" health="$2" canary="$3" note="$4"
+  STATUS_WRITTEN=true
 
 run() {
   if [ "$DRY_RUN" = true ]; then
@@ -248,7 +264,26 @@ rollback() {
   return 1
 }
 
+# ── Unexpected-failure safety net ───────────────────────────────────────────
+# Any uncaught failure (set -e, unbound var, etc.) before a terminal status is
+# written must still leave deploy/staging.json in a terminal state, never
+# 'pending'. The rollback path writes its own status, so this only fires for
+# failures outside that path.
+on_unexpected_failure() {
+  local rc="$1" line="$2"
+  if [ "$STATUS_WRITTEN" = true ]; then
+    return 0
+  fi
+  local run_url="${GITHUB_RUN_URL:-unknown}"
+  local note="unexpected failure during ${CURRENT_STEP} (exit ${rc}, line ${line}); run: ${run_url}"
+  echo "[$(TS)] ERROR: $note" | tee -a "$EVIDENCE_DIR/staging-upgrade.log" >&2
+  write_status "failed" "fail" "fail" "$note" || true
+  return 0
+}
+trap 'on_unexpected_failure "$?" "$LINENO"' ERR
+
 # ── Step 1: baseline health (fail closed on an already-unhealthy instance) ──
+CURRENT_STEP="baseline health check"
 log "Step 1: baseline health check (pre-upgrade)"
 if [ "$DRY_RUN" = false ]; then
   if ! bash "$SCRIPT_DIR/health_check.sh" "$NETWORK" "$CONTRACT_ID" "$HEALTH_SOURCE" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1; then
@@ -261,6 +296,7 @@ else
 fi
 
 # ── Step 2: propose through the standard time-lock ──────────────────────────
+CURRENT_STEP="propose upgrade"
 log "Step 2: proposing upgrade (standard proposal flow)"
 if ! PROPOSE_OUT="$(invoke propose_upgrade --admin-signers "[$ADMIN_ADDRESS]" --new-wasm-hash "$NEW_WASM_HASH" 2>&1)"; then
   echo "$PROPOSE_OUT" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1 || true
@@ -270,6 +306,7 @@ echo "$PROPOSE_OUT" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1 || true
 log "Proposal recorded"
 
 # ── Step 3: wait for the executable window (bounded) ────────────────────────
+CURRENT_STEP="delay wait"
 if [ "$SKIP_DELAY_WAIT" = true ]; then
   log "Step 3: SKIPPED delay wait (rehearsal mode)"
 else
@@ -299,6 +336,7 @@ else
 fi
 
 # ── Step 4: execute ─────────────────────────────────────────────────────────
+CURRENT_STEP="execute upgrade"
 log "Step 4: executing upgrade"
 if [ "$NON_INTERACTIVE" = false ] && [ "$DRY_RUN" = false ]; then
   die "refusing to execute a staging upgrade interactively from CD; re-run with --non-interactive"
@@ -312,6 +350,7 @@ echo "$EXEC_OUT" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1 || true
 log "Upgrade executed"
 
 # ── Step 5: post-deploy verification (health + canary) ─────────────────────
+CURRENT_STEP="post-deploy verification"
 log "Step 5: post-deploy health check"
 if [ "$DRY_RUN" = false ]; then
   # Deliberately broken changes are exercised here in rehearsal via
@@ -341,3 +380,4 @@ else
 fi
 
 log "── Staging upgrade complete and verified ──"
+trap - ERR

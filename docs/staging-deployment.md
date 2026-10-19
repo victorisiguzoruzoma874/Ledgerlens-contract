@@ -110,6 +110,29 @@ rehearsal hook used by `scripts/test-staging-deploy.sh` to prove the path).
 3. The previous WASM for run N+1 is always the artifact of the last green
    run, so repeated failures converge rather than compounding.
 
+### Terminal-status guarantee
+
+A run that fails **always** records a terminal status in `deploy/staging.json`:
+
+| Outcome | Recorded `status` |
+|---|---|
+| Deploy verified (health + canary pass) | `deployed` |
+| Proposal made, delay not yet elapsed | `proposed-pending` (completed by the hourly schedule) |
+| Post-execute failure, rollback executed, post-rollback health passes | `rolled-back` |
+| Post-execute failure, rollback executed, post-rollback health fails | `failed` |
+| Failure before a proposal could be made (build, baseline health, gate) | `failed` |
+
+A failed run **never** leaves `status: pending` behind: the status-publish
+step runs on every exit path (`if: always()`), so the placeholder written at
+the start of the run is always replaced by a terminal value. `pending` only
+ever appears transiently while a run is in flight.
+
+**Promotion is blocked while status is not `verified`/`deployed`.** The
+workflow refuses to promote a commit whose recorded staging status is
+anything other than `deployed` (or `verified` for the health/canary
+verification stage); a `pending`, `proposed-pending`, `rolled-back`, or
+`failed` status halts promotion until staging is green again.
+
 `rollback.sh --non-interactive` (new in this change) only skips the *execute*
 prompt on non-mainnet networks; a mainnet rollback still refuses to run
 non-interactively and requires the typed confirmation. Interactive behaviour
@@ -186,6 +209,37 @@ Rules:
    `docs/incident-response-runbook.md` (freeze if needed, snapshots,
    reconcile) before re-running.
 4. Close the loop on the issue with the root cause and the green run link.
+
+### Triage for the known failing runs
+
+The following runs failed before the terminal-status guarantee was in place
+and may still show `status: pending` in `deploy/staging.json`. Triage each
+one with the same steps:
+
+| Run | URL |
+|---|---|
+| 39168338569 | https://github.com/Ledger-Lenz/Ledgerlens-contract/actions/runs/39168338569 |
+| 39179795853 | https://github.com/Ledger-Lenz/Ledgerlens-contract/actions/runs/39179795853 |
+| 39201651629 | https://github.com/Ledger-Lenz/Ledgerlens-contract/actions/runs/39201651629 |
+| 39240498705 | https://github.com/Ledger-Lenz/Ledgerlens-contract/actions/runs/39240498705 |
+
+For each run:
+
+1. Open the run link and download the `staging-deployment-evidence`
+   artifact.
+2. Read `staging-upgrade.log` top-down (baseline → propose → execute →
+   verify) and note where it stopped.
+3. Check `deploy/staging.json` for the recorded status. A stale `pending`
+   means the run predates the terminal-status guarantee — treat it as
+   `failed` until proven otherwise.
+4. If the status is `failed` (or a stale `pending`), follow § Rollback
+   above: re-propose the previous verified WASM, re-run `health_check.sh`,
+   and record the outcome.
+5. **Do not re-run the workflow until the workflow hardening is merged.**
+   Re-running against the old workflow only reproduces the `pending`
+   outcome; wait for the hardening change to land on `main`, then trigger a
+   `workflow_dispatch` dry run to confirm the terminal status is recorded
+   before promoting again.
 
 ### Local rehearsal (no network)
 

@@ -221,6 +221,60 @@ jobs:
           fi
           exit "$CODE"
 
+      - name: Record terminal status on failure
+        if: failure()
+        env:
+          GITHUB_SHA: ${{ needs.gate.outputs.deploy_sha }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # A failed or aborted run must never leave the placeholder 'pending'
+          # (or an in-flight 'proposed-pending') status behind: rewrite it to a
+          # terminal 'failed' outcome so the commit-back and evidence upload
+          # capture a real result. See issue #1236.
+          if [ ! -f deploy/staging.json ]; then
+            echo "deploy/staging.json missing; nothing to rewrite."
+            exit 0
+          fi
+          python3 - <<'EOF'
+          import json, os
+
+          path = "deploy/staging.json"
+          with open(path) as f:
+              data = json.load(f)
+
+          status = data.get("status", "unknown")
+          if status not in ("pending", "proposed-pending"):
+              print(f"Status already terminal ({status}); leaving as-is.")
+              raise SystemExit(0)
+
+          run_url = os.environ.get("GITHUB_RUN_URL", "")
+          deploy_sha = os.environ.get("GITHUB_SHA", "")
+
+          data["status"] = "failed"
+          data["commit"] = deploy_sha
+          data["run_url"] = run_url
+          data["note"] = (
+              "Staging deployment did not reach verified status; the run failed "
+              "or was aborted before verification completed. See the run logs and "
+              "the staging-deployment-evidence artifact for details."
+          )
+          health = data.get("health")
+          if not isinstance(health, dict):
+              health = {}
+          health["status"] = "fail"
+          data["health"] = health
+          canary = data.get("canary")
+          if not isinstance(canary, dict):
+              canary = {}
+          canary["status"] = "fail"
+          data["canary"] = canary
+
+          with open(path, "w") as f:
+              json.dump(data, f, indent=2, sort_keys=True)
+              f.write("\n")
+          print(f"Recorded terminal status 'failed' in {path}.")
+          EOF
+
       - name: Publish staging status file
         if: always()
         run: |
@@ -269,6 +323,30 @@ jobs:
             target/ledgerlens_score.optimized.wasm.sha256
             target/wasm32-unknown-unknown/release/ledgerlens_score.optimized.wasm
           retention-days: 90
+
+      - name: Promotion guard (staging must be verified)
+        if: always()
+        env:
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Downstream promotion must never proceed unless staging recorded a
+          # verified/deployed outcome. Fail closed on anything else.
+          if [ ! -f deploy/staging.json ]; then
+            echo "ERROR: deploy/staging.json is missing; refusing to allow promotion." >&2
+            exit 1
+          fi
+          STATUS=$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('status','unknown'))")
+          echo "Staging status before promotion: $STATUS"
+          case "$STATUS" in
+            verified|deployed)
+              echo "Promotion guard passed."
+              ;;
+            *)
+              echo "ERROR: staging status '$STATUS' is not verified/deployed; promotion is blocked." >&2
+              echo "See $GITHUB_RUN_URL and docs/staging-deployment.md § Rollback." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Notify maintainers on failure
         if: failure()

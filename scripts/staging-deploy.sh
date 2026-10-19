@@ -59,16 +59,21 @@ verify() {
   fi
 }
 
+# Emit the flat deploy/staging.schema.json shape. Only schema enum values are
+# accepted for `status`: deployed | rolled-back | failed | pending | proposed-pending.
 write_status() {
+  local status="$1" wasm="$2" health="${3:-unknown}" canary="${4:-unknown}" note="${5:-}"
   jq -n --arg network "$NETWORK" --arg contract "$CONTRACT_ID" \
-    --arg status "$1" --arg wasm "$2" --arg previous "$PREVIOUS_HASH" \
+    --arg status "$status" --arg wasm "$wasm" --arg previous "$PREVIOUS_HASH" \
+    --arg health "$health" --arg canary "$canary" --arg note "$note" \
     --arg commit "${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}" \
     --arg version "$(grep -m1 '^version' "$SCRIPT_DIR/../contracts/ledgerlens-score/Cargo.toml" | cut -d'"' -f2)" \
     --arg run_url "${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}" \
     --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{network:$network, contracts:{"ledgerlens-score":$contract}, version:$version,
-      commit:$commit, wasm_sha256:$wasm, previous_wasm_sha256:$previous,
-      last_deployment:{status:$status, at:$at, run_url:$run_url}}' > "$STATUS_FILE"
+    '{schema_version:1, network:$network, contract_id:$contract, version:$version,
+      commit_sha:$commit, wasm_sha256:$wasm, previous_wasm_sha256:$previous,
+      status:$status, health:$health, canary:$canary, note:$note,
+      workflow_run_url:$run_url, last_deploy_utc:$at}' > "$STATUS_FILE"
   cat "$STATUS_FILE"
 }
 
@@ -79,19 +84,24 @@ echo "INFO  previous=$PREVIOUS_HASH new=$NEW_HASH"
 
 if [ "$PREVIOUS_HASH" = "$NEW_HASH" ]; then
   echo "INFO  staging already runs this WASM; verifying only"
-  verify "$NEW_HASH" && { write_status unchanged "$NEW_HASH"; exit 0; }
+  if verify "$NEW_HASH"; then
+    write_status deployed "$NEW_HASH" pass pass "already running this WASM"
+    exit 0
+  fi
+  write_status failed "$NEW_HASH" fail unknown "verification failed for already-deployed WASM"
+  exit 1
 fi
 
 run stellar contract install --wasm "$WASM" --source "$SOURCE" --network "$NETWORK"
 if upgrade_to "$NEW_HASH" && verify "$NEW_HASH"; then
-  write_status deployed "$NEW_HASH"
+  write_status deployed "$NEW_HASH" pass pass ""
   exit 0
 fi
 
 echo "FAIL  deployment verification failed; rolling back to $PREVIOUS_HASH"
 if upgrade_to "$PREVIOUS_HASH" && DRY_RUN_FAIL_VERIFY="" verify "$PREVIOUS_HASH"; then
-  write_status rolled_back "$PREVIOUS_HASH"
+  write_status rolled-back "$PREVIOUS_HASH" pass pass "rolled back to previous WASM"
   exit 1
 fi
-write_status rollback_failed "unknown"
+write_status failed "unknown" fail unknown "rollback failed; manual intervention required"
 exit 3
